@@ -97,6 +97,36 @@ public:
 
     DataMap &getPredecessorMap()
     { return predMap; }
+    
+    /**
+     * Get all successor nodes with a specific edge label
+     * @param src the source node
+     * @param label the edge label
+     * @return a set of successor nodes
+     */
+    std::unordered_set<unsigned> getSuccessors(unsigned src, EdgeLabel label);
+
+    /**
+     * Get all predecessor nodes with a specific edge label
+     * @param dst the destination node
+     * @param label the edge label
+     * @return a set of predecessor nodes
+     */
+    std::unordered_set<unsigned> getPredecessors(unsigned dst, EdgeLabel label);
+    
+    /**
+     * Check if a node is an object node
+     * @param node the node to check
+     * @return true if the node is an object node, false otherwise
+     */
+    bool isObjectNode(unsigned node);
+    
+    /**
+     * Check if a node is a special node (like DummyObjVar)
+     * @param node the node to check
+     * @return true if the node is a special node, false otherwise
+     */
+    bool isSpecialNode(unsigned node);
 
 protected:
     DataMap predMap;   // holding predecessors
@@ -168,6 +198,10 @@ public:
 
     /// Build a graph from PAG
     void buildGraph(SVF::PAG *pag);
+
+    void addEdgeToWorklist(unsigned src, unsigned dst, EdgeLabel label);
+    void applyProductionRules(const CFLREdge& edge);
+    
     /// The dynamic-programming CFL-reachability algorithm.
     void solve();
     /// Dump results into a file
