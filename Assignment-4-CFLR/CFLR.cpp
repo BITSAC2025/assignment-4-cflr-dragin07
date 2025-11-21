@@ -9,382 +9,6 @@ using namespace SVF;
 using namespace llvm;
 using namespace std;
 
-std::unordered_set<unsigned> specialNodeIDs = {3}; // DummyObjVar's ID is 3
-
-// Helper methods to get successors and predecessors with specific labels
-std::unordered_set<unsigned> CFLRGraph::getSuccessors(unsigned src, EdgeLabel label) {
-    if (succMap.find(src) != succMap.end() && succMap[src].find(label) != succMap[src].end()) {
-        return succMap[src][label];
-    }
-    return std::unordered_set<unsigned>();
-}
-
-std::unordered_set<unsigned> CFLRGraph::getPredecessors(unsigned dst, EdgeLabel label) {
-    if (predMap.find(dst) != predMap.end() && predMap[dst].find(label) != predMap[dst].end()) {
-        return predMap[dst][label];
-    }
-    return std::unordered_set<unsigned>();
-}
-
-// Check if a node is an object node
-bool CFLRGraph::isObjectNode(unsigned node) {
-    if (succMap.find(node) != succMap.end()) {
-        auto& succLabels = succMap[node];
-        if (succLabels.find(Addr) != succLabels.end() && !succLabels[Addr].empty()) {
-            return true;
-        }
-    }
-    return false;
-}
-
-// Check if a node is a special node
-bool CFLRGraph::isSpecialNode(unsigned node) {
-    return specialNodeIDs.find(node) != specialNodeIDs.end();
-}
-
-// Helper method to add edge and push to worklist if new
-void CFLR::addEdgeToWorklist(unsigned src, unsigned dst, EdgeLabel label)
-{
-    if (!graph->hasEdge(src, dst, label))
-    {
-        graph->addEdge(src, dst, label);
-        workList.push(CFLREdge(src, dst, label));
-    }
-}
-
-// Apply grammar production rules
-void CFLR::applyProductionRules(const CFLREdge& edge)
-{
-    unsigned src = edge.src;
-    unsigned dst = edge.dst;
-    EdgeLabel label = edge.label;
-
-    // Rule: p = &a
-    // In PAG: a --Addr--> p  =>  p --PT--> a
-    if (label == Addr)
-    {
-        addEdgeToWorklist(dst, src, PT);
-    }
-
-    // Rule: p = q (pointer copy propagation)
-    // In PAG: p --Copy--> q, creates p --VF--> q
-    // If q --PT--> o and p --VF--> q, then p --PT--> o
-    
-    if (label == PT) // src --PT--> dst (src points-to dst)
-    {
-        // Find all q where q --VF--> src (src's value copied to q)
-        for (unsigned q : graph->getPredecessors(src, VF))
-        {
-            addEdgeToWorklist(q, dst, PT);
-        }
-    }
-
-    if (label == VF) // src --VF--> dst (dst's value copied to src)
-    {
-        // Find all o where dst --PT--> o
-        for (unsigned o : graph->getSuccessors(dst, PT))
-        {
-            addEdgeToWorklist(src, o, PT);
-        }
-    }
-    
-    // Rule: (PT)^- ::= Addr VF  =>  (VF)^- (Addr)^- -> (PT)^-
-    if (label == AddrBar)
-    {
-        for (unsigned mid : graph->getPredecessors(dst, VFBar))
-        {
-            addEdgeToWorklist(mid, src, PTBar);
-        }
-    }
-    
-    if (label == VFBar)
-    {
-        for (unsigned mid : graph->getSuccessors(src, AddrBar))
-        {
-            addEdgeToWorklist(dst, mid, PTBar);
-        }
-    }
-    
-    // Rule: VF ::= VF VF (transitivity)
-    if (label == VF)
-    {
-        // Forward: src --VF--> dst --VF--> next  =>  src --VF--> next
-        for (unsigned next : graph->getSuccessors(dst, VF))
-        {
-            addEdgeToWorklist(src, next, VF);
-        }
-        // Backward: prev --VF--> src --VF--> dst  =>  prev --VF--> dst
-        for (unsigned prev : graph->getPredecessors(src, VF))
-        {
-            addEdgeToWorklist(prev, dst, VF);
-        }
-    }
-    
-    // Rule: (VF)^- ::= (VF)^- (VF)^- (transitivity)
-    if (label == VFBar)
-    {
-        for (unsigned next : graph->getPredecessors(dst, VFBar))
-        {
-            addEdgeToWorklist(next, src, VFBar);
-        }
-        for (unsigned prev : graph->getSuccessors(src, VFBar))
-        {
-            addEdgeToWorklist(dst, prev, VFBar);
-        }
-    }
-    
-    // Rule: VF ::= Copy
-    if (label == Copy)
-    {
-        addEdgeToWorklist(src, dst, VF);
-    }
-    
-    // Rule: (VF)^- ::= (Copy)^-
-    if (label == CopyBar)
-    {
-        addEdgeToWorklist(dst, src, VFBar);
-    }
-    
-    // Rule: SV ::= Store VA
-    if (label == Store)
-    {
-        for (unsigned mid : graph->getSuccessors(dst, VA))
-        {
-            addEdgeToWorklist(src, mid, SV);
-        }
-    }
-    
-    if (label == VA)
-    {
-        for (unsigned mid : graph->getPredecessors(src, Store))
-        {
-            addEdgeToWorklist(mid, dst, SV);
-        }
-    }
-    
-    // Rule: (SV)^- ::= (VA)^- (Store)^-
-    if (label == StoreBar)
-    {
-        for (unsigned mid : graph->getPredecessors(dst, VA))
-        {
-            addEdgeToWorklist(mid, src, SVBar);
-        }
-    }
-    
-    if (label == VA)
-    {
-        for (unsigned mid : graph->getSuccessors(src, StoreBar))
-        {
-            addEdgeToWorklist(dst, mid, SVBar);
-        }
-    }
-    
-    // Rule: VF ::= SV Load
-    if (label == SV)
-    {
-        for (unsigned mid : graph->getSuccessors(dst, Load))
-        {
-            addEdgeToWorklist(src, mid, VF);
-        }
-    }
-    
-    if (label == Load)
-    {
-        for (unsigned mid : graph->getPredecessors(src, SV))
-        {
-            addEdgeToWorklist(mid, dst, VF);
-        }
-    }
-    
-    // Rule: (VF)^- ::= (Load)^- (SV)^-
-    if (label == LoadBar)
-    {
-        for (unsigned mid : graph->getPredecessors(dst, SVBar))
-        {
-            addEdgeToWorklist(mid, src, VFBar);
-        }
-    }
-    
-    if (label == SVBar)
-    {
-        for (unsigned mid : graph->getSuccessors(src, LoadBar))
-        {
-            addEdgeToWorklist(dst, mid, VFBar);
-        }
-    }
-    
-    // Rule: LV ::= (Load)^- VA
-    if (label == LoadBar)
-    {
-        for (unsigned mid : graph->getPredecessors(dst, VA))
-        {
-            addEdgeToWorklist(mid, src, LV);
-        }
-    }
-    
-    if (label == VA)
-    {
-        for (unsigned mid : graph->getSuccessors(src, LoadBar))
-        {
-            addEdgeToWorklist(dst, mid, LV);
-        }
-    }
-    
-    // Rule: VA ::= LV Load
-    if (label == LV)
-    {
-        for (unsigned mid : graph->getSuccessors(dst, Load))
-        {
-            addEdgeToWorklist(src, mid, VA);
-        }
-    }
-    
-    if (label == Load)
-    {
-        for (unsigned mid : graph->getPredecessors(src, LV))
-        {
-            addEdgeToWorklist(mid, dst, VA);
-        }
-    }
-    
-    // Rule: PV ::= (PT)^- VA
-    if (label == PTBar)
-    {
-        for (unsigned mid : graph->getPredecessors(dst, VA))
-        {
-            addEdgeToWorklist(mid, src, PV);
-        }
-    }
-    
-    if (label == VA)
-    {
-        for (unsigned mid : graph->getSuccessors(src, PTBar))
-        {
-            addEdgeToWorklist(dst, mid, PV);
-        }
-    }
-    
-    // Rule: VF ::= PV Load
-    if (label == PV)
-    {
-        for (unsigned mid : graph->getSuccessors(dst, Load))
-        {
-            addEdgeToWorklist(src, mid, VF);
-        }
-    }
-    
-    if (label == Load)
-    {
-        for (unsigned mid : graph->getPredecessors(src, PV))
-        {
-            addEdgeToWorklist(mid, dst, VF);
-        }
-    }
-    
-    // Rule: (VF)^- ::= (Load)^- (PV)^-
-    if (label == LoadBar)
-    {
-        for (unsigned mid : graph->getPredecessors(dst, PVBar))
-        {
-            addEdgeToWorklist(mid, src, VFBar);
-        }
-    }
-    
-    if (label == PVBar)
-    {
-        for (unsigned mid : graph->getSuccessors(src, LoadBar))
-        {
-            addEdgeToWorklist(dst, mid, VFBar);
-        }
-    }
-    
-    // Rule: VP ::= VA PT
-    if (label == VA)
-    {
-        for (unsigned mid : graph->getSuccessors(dst, PT))
-        {
-            addEdgeToWorklist(src, mid, VP);
-        }
-    }
-    
-    if (label == PT)
-    {
-        for (unsigned mid : graph->getPredecessors(src, VA))
-        {
-            addEdgeToWorklist(mid, dst, VP);
-        }
-    }
-    
-    // Rule: VF ::= Store VP
-    if (label == Store)
-    {
-        for (unsigned mid : graph->getSuccessors(dst, VP))
-        {
-            addEdgeToWorklist(src, mid, VF);
-        }
-    }
-    
-    if (label == VP)
-    {
-        for (unsigned mid : graph->getPredecessors(src, Store))
-        {
-            addEdgeToWorklist(mid, dst, VF);
-        }
-    }
-    
-    // Rule: (VF)^- ::= (VP)^- (Store)^-
-    if (label == VPBar)
-    {
-        for (unsigned mid : graph->getSuccessors(src, StoreBar))
-        {
-            addEdgeToWorklist(dst, mid, VFBar);
-        }
-    }
-    
-    if (label == StoreBar)
-    {
-        for (unsigned mid : graph->getPredecessors(src, VPBar))
-        {
-            addEdgeToWorklist(mid, dst, VFBar);
-        }
-    }
-    
-    // Rule: VA ::= (VF)^- VA
-    if (label == VFBar)
-    {
-        for (unsigned mid : graph->getPredecessors(dst, VA))
-        {
-            addEdgeToWorklist(mid, src, VA);
-        }
-    }
-    
-    if (label == VA)
-    {
-        for (unsigned mid : graph->getSuccessors(src, VFBar))
-        {
-            addEdgeToWorklist(dst, mid, VA);
-        }
-    }
-    
-    // Rule: VA ::= VA VF
-    if (label == VA)
-    {
-        for (unsigned mid : graph->getSuccessors(dst, VF))
-        {
-            addEdgeToWorklist(src, mid, VA);
-        }
-    }
-    
-    if (label == VF)
-    {
-        for (unsigned mid : graph->getPredecessors(src, VA))
-        {
-            addEdgeToWorklist(mid, dst, VA);
-        }
-    }
-}
-
-
 int main(int argc, char **argv)
 {
     auto moduleNameVec =
@@ -395,7 +19,7 @@ int main(int argc, char **argv)
 
     SVFIRBuilder builder;
     auto pag = builder.build();
-    pag->dump("PAG");
+    pag->dump();
 
     CFLR solver;
     solver.buildGraph(pag);
@@ -409,31 +33,142 @@ int main(int argc, char **argv)
 
 void CFLR::solve()
 {
-    // Initialize worklist with existing edges
-    for (auto& nodeItr : graph->getSuccessorMap())
-    {
-        unsigned src = nodeItr.first;
-        for (auto& lblItr : nodeItr.second)
-        {
-            EdgeLabel label = lblItr.first;
-            for (unsigned dst : lblItr.second)
-            {
-                workList.push(CFLREdge(src, dst, label));
+    // Dynamic programming CFL-reachability algorithm
+    while (!workList.empty()) {
+        CFLREdge edge = workList.pop();
+        unsigned src = edge.src;
+        unsigned dst = edge.dst;
+        EdgeLabel label = edge.label;
+        
+        auto &succMap = graph->getSuccessorMap();
+        auto &predMap = graph->getPredecessorMap();
+        
+        // Rule 1: Addr ⊆ PT and Addr ⊆ PV
+        // p = &o generates both points-to and value relations
+        if (label == Addr) {
+            if (!graph->hasEdge(src, dst, PT)) {
+                graph->addEdge(src, dst, PT);
+                workList.push(CFLREdge(src, dst, PT));
+            }
+            if (!graph->hasEdge(src, dst, PV)) {
+                graph->addEdge(src, dst, PV);
+                workList.push(CFLREdge(src, dst, PV));
             }
         }
-    }
-    
-    // Add epsilon edges for VA (VA ::= epsilon means every node has VA self-loop)
-    for (auto& nodeItr : graph->getSuccessorMap())
-    {
-        unsigned node = nodeItr.first;
-        addEdgeToWorklist(node, node, VA);
-    }
-    
-    // Dynamic programming algorithm
-    while (!workList.empty())
-    {
-        CFLREdge edge = workList.pop();
-        applyProductionRules(edge);
+        
+        // Rule 2: Copy · PT ⊆ PT
+        // p = q, q points-to o => p points-to o
+        if (label == Copy) {
+            if (succMap.count(dst) && succMap[dst].count(PT)) {
+                for (unsigned o : succMap[dst][PT]) {
+                    if (!graph->hasEdge(src, o, PT)) {
+                        graph->addEdge(src, o, PT);
+                        workList.push(CFLREdge(src, o, PT));
+                    }
+                }
+            }
+        }
+        if (label == PT) {
+            if (predMap.count(src) && predMap[src].count(Copy)) {
+                for (unsigned x : predMap[src][Copy]) {
+                    if (!graph->hasEdge(x, dst, PT)) {
+                        graph->addEdge(x, dst, PT);
+                        workList.push(CFLREdge(x, dst, PT));
+                    }
+                }
+            }
+        }
+        
+        // Rule 3: PT · Load ⊆ VP
+        // x points-to m, load from m to p => value flows from x to p
+        if (label == PT) {
+            if (succMap.count(dst) && succMap[dst].count(Load)) {
+                for (unsigned p : succMap[dst][Load]) {
+                    if (!graph->hasEdge(src, p, VP)) {
+                        graph->addEdge(src, p, VP);
+                        workList.push(CFLREdge(src, p, VP));
+                    }
+                }
+            }
+        }
+        if (label == Load) {
+            if (predMap.count(src) && predMap[src].count(PT)) {
+                for (unsigned x : predMap[src][PT]) {
+                    if (!graph->hasEdge(x, dst, VP)) {
+                        graph->addEdge(x, dst, VP);
+                        workList.push(CFLREdge(x, dst, VP));
+                    }
+                }
+            }
+        }
+        
+        // Rule 4: Store · PT ⊆ SV
+        // p stores q, q points-to o => intermediate store-value relation
+        if (label == Store) {
+            if (succMap.count(dst) && succMap[dst].count(PT)) {
+                for (unsigned o : succMap[dst][PT]) {
+                    if (!graph->hasEdge(src, o, SV)) {
+                        graph->addEdge(src, o, SV);
+                        workList.push(CFLREdge(src, o, SV));
+                    }
+                }
+            }
+        }
+        if (label == PT) {
+            if (predMap.count(src) && predMap[src].count(Store)) {
+                for (unsigned x : predMap[src][Store]) {
+                    if (!graph->hasEdge(x, dst, SV)) {
+                        graph->addEdge(x, dst, SV);
+                        workList.push(CFLREdge(x, dst, SV));
+                    }
+                }
+            }
+        }
+        
+        // Rule 5: PT · SV ⊆ PV
+        // p points-to m, p has store-value o => m has pointer-value o
+        if (label == PT) {
+            if (succMap.count(src) && succMap[src].count(SV)) {
+                for (unsigned o : succMap[src][SV]) {
+                    if (!graph->hasEdge(dst, o, PV)) {
+                        graph->addEdge(dst, o, PV);
+                        workList.push(CFLREdge(dst, o, PV));
+                    }
+                }
+            }
+        }
+        if (label == SV) {
+            if (succMap.count(src) && succMap[src].count(PT)) {
+                for (unsigned m : succMap[src][PT]) {
+                    if (!graph->hasEdge(m, dst, PV)) {
+                        graph->addEdge(m, dst, PV);
+                        workList.push(CFLREdge(m, dst, PV));
+                    }
+                }
+            }
+        }
+        
+        // Rule 6: VP · PV ⊆ PT
+        // value flows to p through x, x has pointer-value o => p points-to o
+        if (label == VP) {
+            if (succMap.count(dst) && succMap[dst].count(PV)) {
+                for (unsigned o : succMap[dst][PV]) {
+                    if (!graph->hasEdge(src, o, PT)) {
+                        graph->addEdge(src, o, PT);
+                        workList.push(CFLREdge(src, o, PT));
+                    }
+                }
+            }
+        }
+        if (label == PV) {
+            if (predMap.count(src) && predMap[src].count(VP)) {
+                for (unsigned x : predMap[src][VP]) {
+                    if (!graph->hasEdge(x, dst, PT)) {
+                        graph->addEdge(x, dst, PT);
+                        workList.push(CFLREdge(x, dst, PT));
+                    }
+                }
+            }
+        }
     }
 }
