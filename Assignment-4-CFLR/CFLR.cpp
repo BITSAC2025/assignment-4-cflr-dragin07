@@ -19,7 +19,7 @@ int main(int argc, char **argv)
 
     SVFIRBuilder builder;
     auto pag = builder.build();
-    pag->dump();
+    pag->dump("PAG");
 
     CFLR solver;
     solver.buildGraph(pag);
@@ -33,142 +33,290 @@ int main(int argc, char **argv)
 
 void CFLR::solve()
 {
-    // Dynamic programming CFL-reachability algorithm
-    while (!workList.empty()) {
+    // 收集所有节点并初始化工作表
+    std::unordered_set<unsigned> allNodes;
+    
+    // 将图中所有已存在的边加入工作表
+    for (auto &nodeItr : graph->getSuccessorMap())
+    {
+        unsigned src = nodeItr.first;
+        allNodes.insert(src);
+        
+        for (auto &lblItr : nodeItr.second)
+        {
+            EdgeLabel label = lblItr.first;
+            for (auto dst : lblItr.second)
+            {
+                allNodes.insert(dst);
+                workList.push(CFLREdge(src, dst, label));
+            }
+        }
+    }
+    
+    // 辅助 lambda 函数：添加边（如果不存在则加入图和工作表）
+    auto addEdge = [this](unsigned src, unsigned dst, EdgeLabel label) {
+        if (!graph->hasEdge(src, dst, label))
+        {
+            graph->addEdge(src, dst, label);
+            workList.push(CFLREdge(src, dst, label));
+        }
+    };
+    
+    // 为每个节点添加 epsilon 边（VF, VFBar, VA）
+    for (auto node : allNodes)
+    {
+        addEdge(node, node, VF);
+        addEdge(node, node, VFBar);
+        addEdge(node, node, VA);
+    }
+    
+    // 主循环：动态规划 CFL 可达性算法
+    while (!workList.empty())
+    {
         CFLREdge edge = workList.pop();
-        unsigned src = edge.src;
-        unsigned dst = edge.dst;
+        unsigned x = edge.src;
+        unsigned z = edge.dst;
         EdgeLabel label = edge.label;
         
         auto &succMap = graph->getSuccessorMap();
         auto &predMap = graph->getPredecessorMap();
         
-        // Rule 1: Addr ⊆ PT and Addr ⊆ PV
-        // p = &o generates both points-to and value relations
-        if (label == Addr) {
-            if (!graph->hasEdge(src, dst, PT)) {
-                graph->addEdge(src, dst, PT);
-                workList.push(CFLREdge(src, dst, PT));
+        // 应用语法规则 A ::= B C
+        // 情况1: 新边是 B (x -B-> z)，找所有 z -C-> w，添加 x -A-> w
+        // 情况2: 新边是 C (x -C-> z)，找所有 y -B-> x，添加 y -A-> z
+        
+        // PT ::= VFBar AddrBar
+        if (label == VFBar && succMap.count(z) && succMap[z].count(AddrBar))
+        {
+            for (auto w : succMap[z][AddrBar])
+                addEdge(x, w, PT);
+        }
+        if (label == AddrBar && predMap.count(x) && predMap[x].count(VFBar))
+        {
+            for (auto y : predMap[x][VFBar])
+                addEdge(y, z, PT);
+        }
+        
+        // PTBar ::= Addr VF
+        if (label == Addr && succMap.count(z) && succMap[z].count(VF))
+        {
+            for (auto w : succMap[z][VF])
+                addEdge(x, w, PTBar);
+        }
+        if (label == VF && predMap.count(x) && predMap[x].count(Addr))
+        {
+            for (auto y : predMap[x][Addr])
+                addEdge(y, z, PTBar);
+        }
+        
+        // VF ::= VF VF
+        if (label == VF)
+        {
+            if (succMap.count(z) && succMap[z].count(VF))
+            {
+                for (auto w : succMap[z][VF])
+                    addEdge(x, w, VF);
             }
-            if (!graph->hasEdge(src, dst, PV)) {
-                graph->addEdge(src, dst, PV);
-                workList.push(CFLREdge(src, dst, PV));
+            if (predMap.count(x) && predMap[x].count(VF))
+            {
+                for (auto y : predMap[x][VF])
+                    addEdge(y, z, VF);
             }
         }
         
-        // Rule 2: Copy · PT ⊆ PT
-        // p = q, q points-to o => p points-to o
-        if (label == Copy) {
-            if (succMap.count(dst) && succMap[dst].count(PT)) {
-                for (unsigned o : succMap[dst][PT]) {
-                    if (!graph->hasEdge(src, o, PT)) {
-                        graph->addEdge(src, o, PT);
-                        workList.push(CFLREdge(src, o, PT));
-                    }
-                }
-            }
+        // VF ::= Copy
+        if (label == Copy)
+        {
+            addEdge(x, z, VF);
         }
-        if (label == PT) {
-            if (predMap.count(src) && predMap[src].count(Copy)) {
-                for (unsigned x : predMap[src][Copy]) {
-                    if (!graph->hasEdge(x, dst, PT)) {
-                        graph->addEdge(x, dst, PT);
-                        workList.push(CFLREdge(x, dst, PT));
-                    }
-                }
+        
+        // VF ::= SV Load
+        if (label == SV && succMap.count(z) && succMap[z].count(Load))
+        {
+            for (auto w : succMap[z][Load])
+                addEdge(x, w, VF);
+        }
+        if (label == Load && predMap.count(x) && predMap[x].count(SV))
+        {
+            for (auto y : predMap[x][SV])
+                addEdge(y, z, VF);
+        }
+        
+        // VF ::= PV Load
+        if (label == PV && succMap.count(z) && succMap[z].count(Load))
+        {
+            for (auto w : succMap[z][Load])
+                addEdge(x, w, VF);
+        }
+        if (label == Load && predMap.count(x) && predMap[x].count(PV))
+        {
+            for (auto y : predMap[x][PV])
+                addEdge(y, z, VF);
+        }
+        
+        // VF ::= Store VP
+        if (label == Store && succMap.count(z) && succMap[z].count(VP))
+        {
+            for (auto w : succMap[z][VP])
+                addEdge(x, w, VF);
+        }
+        if (label == VP && predMap.count(x) && predMap[x].count(Store))
+        {
+            for (auto y : predMap[x][Store])
+                addEdge(y, z, VF);
+        }
+        
+        // VFBar ::= VFBar VFBar
+        if (label == VFBar)
+        {
+            if (succMap.count(z) && succMap[z].count(VFBar))
+            {
+                for (auto w : succMap[z][VFBar])
+                    addEdge(x, w, VFBar);
+            }
+            if (predMap.count(x) && predMap[x].count(VFBar))
+            {
+                for (auto y : predMap[x][VFBar])
+                    addEdge(y, z, VFBar);
             }
         }
         
-        // Rule 3: PT · Load ⊆ VP
-        // x points-to m, load from m to p => value flows from x to p
-        if (label == PT) {
-            if (succMap.count(dst) && succMap[dst].count(Load)) {
-                for (unsigned p : succMap[dst][Load]) {
-                    if (!graph->hasEdge(src, p, VP)) {
-                        graph->addEdge(src, p, VP);
-                        workList.push(CFLREdge(src, p, VP));
-                    }
-                }
-            }
-        }
-        if (label == Load) {
-            if (predMap.count(src) && predMap[src].count(PT)) {
-                for (unsigned x : predMap[src][PT]) {
-                    if (!graph->hasEdge(x, dst, VP)) {
-                        graph->addEdge(x, dst, VP);
-                        workList.push(CFLREdge(x, dst, VP));
-                    }
-                }
-            }
+        // VFBar ::= CopyBar
+        if (label == CopyBar)
+        {
+            addEdge(x, z, VFBar);
         }
         
-        // Rule 4: Store · PT ⊆ SV
-        // p stores q, q points-to o => intermediate store-value relation
-        if (label == Store) {
-            if (succMap.count(dst) && succMap[dst].count(PT)) {
-                for (unsigned o : succMap[dst][PT]) {
-                    if (!graph->hasEdge(src, o, SV)) {
-                        graph->addEdge(src, o, SV);
-                        workList.push(CFLREdge(src, o, SV));
-                    }
-                }
-            }
+        // VFBar ::= LoadBar SVBar
+        if (label == LoadBar && succMap.count(z) && succMap[z].count(SVBar))
+        {
+            for (auto w : succMap[z][SVBar])
+                addEdge(x, w, VFBar);
         }
-        if (label == PT) {
-            if (predMap.count(src) && predMap[src].count(Store)) {
-                for (unsigned x : predMap[src][Store]) {
-                    if (!graph->hasEdge(x, dst, SV)) {
-                        graph->addEdge(x, dst, SV);
-                        workList.push(CFLREdge(x, dst, SV));
-                    }
-                }
-            }
+        if (label == SVBar && predMap.count(x) && predMap[x].count(LoadBar))
+        {
+            for (auto y : predMap[x][LoadBar])
+                addEdge(y, z, VFBar);
         }
         
-        // Rule 5: PT · SV ⊆ PV
-        // p points-to m, p has store-value o => m has pointer-value o
-        if (label == PT) {
-            if (succMap.count(src) && succMap[src].count(SV)) {
-                for (unsigned o : succMap[src][SV]) {
-                    if (!graph->hasEdge(dst, o, PV)) {
-                        graph->addEdge(dst, o, PV);
-                        workList.push(CFLREdge(dst, o, PV));
-                    }
-                }
-            }
+        // VFBar ::= LoadBar VP
+        if (label == LoadBar && succMap.count(z) && succMap[z].count(VP))
+        {
+            for (auto w : succMap[z][VP])
+                addEdge(x, w, VFBar);
         }
-        if (label == SV) {
-            if (succMap.count(src) && succMap[src].count(PT)) {
-                for (unsigned m : succMap[src][PT]) {
-                    if (!graph->hasEdge(m, dst, PV)) {
-                        graph->addEdge(m, dst, PV);
-                        workList.push(CFLREdge(m, dst, PV));
-                    }
-                }
-            }
+        if (label == VP && predMap.count(x) && predMap[x].count(LoadBar))
+        {
+            for (auto y : predMap[x][LoadBar])
+                addEdge(y, z, VFBar);
         }
         
-        // Rule 6: VP · PV ⊆ PT
-        // value flows to p through x, x has pointer-value o => p points-to o
-        if (label == VP) {
-            if (succMap.count(dst) && succMap[dst].count(PV)) {
-                for (unsigned o : succMap[dst][PV]) {
-                    if (!graph->hasEdge(src, o, PT)) {
-                        graph->addEdge(src, o, PT);
-                        workList.push(CFLREdge(src, o, PT));
-                    }
-                }
-            }
+        // VFBar ::= PV StoreBar
+        if (label == PV && succMap.count(z) && succMap[z].count(StoreBar))
+        {
+            for (auto w : succMap[z][StoreBar])
+                addEdge(x, w, VFBar);
         }
-        if (label == PV) {
-            if (predMap.count(src) && predMap[src].count(VP)) {
-                for (unsigned x : predMap[src][VP]) {
-                    if (!graph->hasEdge(x, dst, PT)) {
-                        graph->addEdge(x, dst, PT);
-                        workList.push(CFLREdge(x, dst, PT));
-                    }
-                }
-            }
+        if (label == StoreBar && predMap.count(x) && predMap[x].count(PV))
+        {
+            for (auto y : predMap[x][PV])
+                addEdge(y, z, VFBar);
+        }
+        
+        // VA ::= LV Load
+        if (label == LV && succMap.count(z) && succMap[z].count(Load))
+        {
+            for (auto w : succMap[z][Load])
+                addEdge(x, w, VA);
+        }
+        if (label == Load && predMap.count(x) && predMap[x].count(LV))
+        {
+            for (auto y : predMap[x][LV])
+                addEdge(y, z, VA);
+        }
+        
+        // VA ::= VFBar VA
+        if (label == VFBar && succMap.count(z) && succMap[z].count(VA))
+        {
+            for (auto w : succMap[z][VA])
+                addEdge(x, w, VA);
+        }
+        if (label == VA && predMap.count(x) && predMap[x].count(VFBar))
+        {
+            for (auto y : predMap[x][VFBar])
+                addEdge(y, z, VA);
+        }
+        
+        // VA ::= VA VF
+        if (label == VA && succMap.count(z) && succMap[z].count(VF))
+        {
+            for (auto w : succMap[z][VF])
+                addEdge(x, w, VA);
+        }
+        if (label == VF && predMap.count(x) && predMap[x].count(VA))
+        {
+            for (auto y : predMap[x][VA])
+                addEdge(y, z, VA);
+        }
+        
+        // SV ::= Store VA
+        if (label == Store && succMap.count(z) && succMap[z].count(VA))
+        {
+            for (auto w : succMap[z][VA])
+                addEdge(x, w, SV);
+        }
+        if (label == VA && predMap.count(x) && predMap[x].count(Store))
+        {
+            for (auto y : predMap[x][Store])
+                addEdge(y, z, SV);
+        }
+        
+        // SVBar ::= VA StoreBar
+        if (label == VA && succMap.count(z) && succMap[z].count(StoreBar))
+        {
+            for (auto w : succMap[z][StoreBar])
+                addEdge(x, w, SVBar);
+        }
+        if (label == StoreBar && predMap.count(x) && predMap[x].count(VA))
+        {
+            for (auto y : predMap[x][VA])
+                addEdge(y, z, SVBar);
+        }
+        
+        // PV ::= PTBar VA
+        if (label == PTBar && succMap.count(z) && succMap[z].count(VA))
+        {
+            for (auto w : succMap[z][VA])
+                addEdge(x, w, PV);
+        }
+        if (label == VA && predMap.count(x) && predMap[x].count(PTBar))
+        {
+            for (auto y : predMap[x][PTBar])
+                addEdge(y, z, PV);
+        }
+        
+        // VP ::= VA PT
+        if (label == VA && succMap.count(z) && succMap[z].count(PT))
+        {
+            for (auto w : succMap[z][PT])
+                addEdge(x, w, VP);
+        }
+        if (label == PT && predMap.count(x) && predMap[x].count(VA))
+        {
+            for (auto y : predMap[x][VA])
+                addEdge(y, z, VP);
+        }
+        
+        // LV ::= LoadBar VA
+        if (label == LoadBar && succMap.count(z) && succMap[z].count(VA))
+        {
+            for (auto w : succMap[z][VA])
+                addEdge(x, w, LV);
+        }
+        if (label == VA && predMap.count(x) && predMap[x].count(LoadBar))
+        {
+            for (auto y : predMap[x][LoadBar])
+                addEdge(y, z, LV);
         }
     }
 }
